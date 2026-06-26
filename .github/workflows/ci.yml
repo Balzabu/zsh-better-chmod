@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, modernize ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: zsh version
+        run: zsh --version
+
+      - name: Syntax check
+        run: |
+          zsh -n zsh-better-chmod.plugin.zsh
+          zsh -n functions/chmod_extended
+          zsh -n tests/test.zsh
+
+      - name: Run test suite
+        run: zsh tests/test.zsh

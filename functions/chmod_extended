@@ -1,0 +1,187 @@
+#compdef chmod_extended
+# chmod_extended: enhanced chmod with symbolic/octal input, validation and
+# colored output. Autoloaded by zsh-better-chmod.
+#
+# This file is the function body (Zsh autoload). It is a strict superset of the
+# real chmod: anything it does not specifically enhance is passed through,
+# unchanged, to `command chmod`, so no existing flag ever changes meaning.
+#
+# https://github.com/Balzabu/zsh-better-chmod  (MIT License)
+
+emulate -L zsh
+setopt local_options
+
+# --- Colors (only when stdout is a terminal) -------------------------------
+local red green blue cyan reset bold
+if [[ -t 1 ]]; then
+    red=$'\e[31m'; green=$'\e[32m'; blue=$'\e[34m'; cyan=$'\e[36m'
+    reset=$'\e[0m'; bold=$'\e[1m'
+else
+    red='' green='' blue='' cyan='' reset='' bold=''
+fi
+local arrow='→' ok='✓' bad='✘'
+
+# --- Help (only on --help or no arguments; NOT on -h) ----------------------
+if [[ $# -eq 0 || "$1" == "--help" ]]; then
+    print -r -- "${cyan}Usage${reset}: chmod [OPTIONS] MODE FILE..."
+    print -r -- ""
+    print -r -- "${bold}Standard chmod options:${reset}"
+    print -r -- "  -R, --recursive        Change files and directories recursively"
+    print -r -- "  -c, --changes          Report only when a change is made"
+    print -r -- "  -f, --silent, --quiet  Suppress most error messages"
+    print -r -- "  -v, --verbose          Output a diagnostic for every file processed"
+    print -r -- "  -h, --no-dereference   Affect symbolic links instead of referenced files"
+    print -r -- "  --reference=RFILE      Use RFILE's mode instead of MODE values"
+    print -r -- "  --version              Output version information and exit"
+    print -r -- "  --help                 Display this help and exit"
+    print -r -- ""
+    print -r -- "${bold}Enhanced permission formats:${reset}"
+    print -r -- "  chmod ${green}-rwxr-xr--${reset} file.txt    ${blue}# symbolic format for files${reset}"
+    print -r -- "  chmod ${green}drwxr-xr--${reset} dir/        ${blue}# symbolic format for directories${reset}"
+    print -r -- "  chmod ${green}-rwsr-xr-x${reset} file.txt    ${blue}# setuid/setgid/sticky supported${reset}"
+    print -r -- "  chmod ${green}755${reset} file.txt           ${blue}# octal format${reset}"
+    [[ "$1" == "--help" ]] && return 0
+    return 1
+fi
+
+# --- Version ---------------------------------------------------------------
+if [[ "$1" == "--version" ]]; then
+    print -r -- "zsh-better-chmod 1.1.0"
+    command chmod --version 2>/dev/null   # GNU only; silent no-op on BSD/macOS
+    return 0
+fi
+
+# --- Parse arguments into options / mode / targets -------------------------
+# Symbolic permission core: 9 chars, special bits (s/S/t/T) allowed.
+local sym_core='[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]'
+local re_dash="^-${sym_core}$"   # leading '-' (file)  -> e.g. -rwxr-xr--
+local re_dir="^d${sym_core}$"    # leading 'd' (dir)   -> e.g. drwxr-xr--
+local re_oct='^[0-7]{3,4}$'      # octal, 3 or 4 digits
+
+local -a options targets
+local mode='' arg
+local recursive=0
+
+for arg in "$@"; do
+    if [[ "$arg" == --reference* ]]; then
+        options+=( "$arg" )
+    elif [[ "$arg" == -* ]]; then
+        if [[ -z "$mode" && "$arg" =~ $re_dash ]]; then
+            mode="$arg"
+        else
+            options+=( "$arg" )
+        fi
+    elif [[ -z "$mode" && ( "$arg" =~ $re_dir || "$arg" =~ $re_oct ) ]]; then
+        mode="$arg"
+    else
+        targets+=( "$arg" )
+    fi
+    # Detect recursion (covers -R, -Rv, -vR, --recursive) so the file/dir
+    # type check below does not wrongly reject a directory tree.
+    [[ "$arg" == --recursive || ( "$arg" == -[^-]* && "$arg" == *R* ) ]] && recursive=1
+done
+
+# --- Fallback: delegate untouched whenever we are not enhancing -------------
+if [[ -z "$mode" || ${#targets} -eq 0 ]]; then
+    command chmod "$@"
+    return $?
+fi
+
+# --- Symbolic mode ---------------------------------------------------------
+if [[ "$mode" =~ $re_dash || "$mode" =~ $re_dir ]]; then
+    local file_type="${mode[1]}"     # '-' or 'd'
+    local core="${mode[2,10]}"       # 9-char permission core
+
+    # Convert symbolic core -> octal (including setuid/setgid/sticky).
+    local u="${core[1,3]}" g="${core[4,6]}" o="${core[7,9]}"
+    local -i special=0 v
+    local d1 d2 d3
+
+    v=0
+    [[ "${u[1]}" == r ]] && (( v += 4 ))
+    [[ "${u[2]}" == w ]] && (( v += 2 ))
+    case "${u[3]}" in
+        x) (( v += 1 ));;
+        s) (( v += 1 )); (( special += 4 ));;
+        S) (( special += 4 ));;
+    esac
+    d1=$v
+
+    v=0
+    [[ "${g[1]}" == r ]] && (( v += 4 ))
+    [[ "${g[2]}" == w ]] && (( v += 2 ))
+    case "${g[3]}" in
+        x) (( v += 1 ));;
+        s) (( v += 1 )); (( special += 2 ));;
+        S) (( special += 2 ));;
+    esac
+    d2=$v
+
+    v=0
+    [[ "${o[1]}" == r ]] && (( v += 4 ))
+    [[ "${o[2]}" == w ]] && (( v += 2 ))
+    case "${o[3]}" in
+        x) (( v += 1 ));;
+        t) (( v += 1 )); (( special += 1 ));;
+        T) (( special += 1 ));;
+    esac
+    d3=$v
+
+    local octal="${d1}${d2}${d3}"
+    (( special > 0 )) && octal="${special}${octal}"
+
+    local target; local -i rc=0
+    for target in "${targets[@]}"; do
+        if [[ ! -e "$target" && ! -L "$target" ]]; then
+            print -r -- "${red}${bad}${reset} File not found: $target"
+            rc=1; continue
+        fi
+        # Type validation only makes sense for a single, non-recursive target.
+        if (( ! recursive )); then
+            if [[ "$file_type" == d && ! -d "$target" ]]; then
+                print -r -- "${red}${bad}${reset} Not a directory: $target"
+                rc=1; continue
+            fi
+            if [[ "$file_type" == - && ! -f "$target" ]]; then
+                print -r -- "${red}${bad}${reset} Not a regular file: $target"
+                rc=1; continue
+            fi
+        fi
+        if command chmod "${options[@]}" "$octal" "$target"; then
+            print -r -- "${green}${ok}${reset} ${target} ${blue}${arrow}${reset} ${octal} (${mode})"
+        else
+            print -r -- "${red}${bad}${reset} Failed to set permissions on $target"
+            rc=1
+        fi
+    done
+    return $rc
+
+# --- Octal mode ------------------------------------------------------------
+elif [[ "$mode" =~ $re_oct ]]; then
+    # Pick the right stat syntax once (GNU: -c %A, BSD/macOS: -f %Sp).
+    local -i stat_gnu=0
+    stat -c '%A' . >/dev/null 2>&1 && stat_gnu=1
+
+    local target sym; local -i rc=0
+    for target in "${targets[@]}"; do
+        if command chmod "${options[@]}" "$mode" "$target"; then
+            if (( stat_gnu )); then
+                sym="$(stat -c '%A' "$target" 2>/dev/null)"
+            else
+                sym="$(stat -f '%Sp' "$target" 2>/dev/null)"
+            fi
+            if [[ -n "$sym" ]]; then
+                print -r -- "${green}${ok}${reset} ${target} ${blue}${arrow}${reset} ${mode} (${sym})"
+            else
+                print -r -- "${green}${ok}${reset} ${target} ${blue}${arrow}${reset} ${mode}"
+            fi
+        else
+            print -r -- "${red}${bad}${reset} Failed to set permissions on $target"
+            rc=1
+        fi
+    done
+    return $rc
+fi
+
+# Safety net: anything else goes straight to chmod.
+command chmod "$@"
